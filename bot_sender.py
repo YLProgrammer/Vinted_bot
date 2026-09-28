@@ -15,7 +15,7 @@ from config import (
     REAL_DEAL_THRESHOLD, REAL_DEAL_MIN_SAMPLES, REFERRAL_BONUS_DAYS,
 )
 from db import (
-    init_db, get_connection, upsert_user, get_user,
+    init_db, get_connection, upsert_user, get_user, supprimer_utilisateur_complet,
     credit_referral, purger_premium_expire, maj_stats_prix_recherche,
     ajouter_veille_vendeur, lister_veilles_vendeur, supprimer_veille_vendeur,
     toutes_les_veilles_vendeur_actives,
@@ -61,11 +61,17 @@ def editer_photo(chat_id, message_id, photo_url, caption, reply_markup=None, par
 
 
 # --- Clavier persistant (visible en permanence sous la zone de texte) ---
-def clavier_principal():
+def langue_utilisateur(chat_id):
+    user = get_user(chat_id)
+    return user.get("language") if user and user.get("language") in ("fr", "en") else "fr"
+
+
+def clavier_principal(chat_id=None):
+    en = chat_id is not None and langue_utilisateur(chat_id) == "en"
     return {
         "keyboard": [
-            ["🔍 Nouvelle recherche", "📋 Mes recherches"],
-            ["⏸️ Pause", "▶️ Reprendre"],
+            (["🔍 New search", "📋 My searches"] if en else ["🔍 Nouvelle recherche", "📋 Mes recherches"]),
+            (["⏸️ Pause", "▶️ Resume"] if en else ["⏸️ Pause", "▶️ Reprendre"]),
             ["❤️ Wishlist", "🕵️ Vendeurs suivis"],
             ["📊 Stats", "🎁 Parrainage"],
             ["💡 Feedback", "🛠️ Aide"],
@@ -75,10 +81,13 @@ def clavier_principal():
 
 
 REPLY_KEYBOARD_MAP = {
-    "🔍 Nouvelle recherche": "/newsearch",
+    "🔍 Nouvelle recherche": "/recherche",
+    "🔍 New search": "/newsearch",
     "📋 Mes recherches": "/list",
+    "📋 My searches": "/list",
     "⏸️ Pause": "/pause",
     "▶️ Reprendre": "/resume",
+    "▶️ Resume": "/resume",
     "❤️ Wishlist": "/wishlist",
     "🕵️ Vendeurs suivis": "/sellers",
     "📊 Stats": "/stats",
@@ -92,12 +101,12 @@ def definir_commandes_sender():
     commandes = [
         {"command": "help", "description": "Afficher l'aide complète"},
         {"command": "start", "description": "Démarrer et activer son compte VintedPulse"},
-        {"command": "newsearch", "description": "Créer une nouvelle alerte Vinted pas à pas"},
+        {"command": "recherche", "description": "Créer une nouvelle alerte Vinted pas à pas"},
         {"command": "list", "description": "Afficher vos recherches actives"},
         {"command": "delete", "description": "Supprimer une recherche spécifique"},
         {"command": "stop", "description": "🛑 Stopper et supprimer toutes les recherches"},
-        {"command": "cancel", "description": "Annuler la création de recherche en cours"},
         {"command": "disconnect", "description": "Dissocier ton compte"},
+        {"command": "deleteaccount", "description": "Supprimer toutes vos données"},
         {"command": "feedback", "description": "Suggérer une idée ou signaler un bug"},
         {"command": "pause", "description": "Mettre en pause la veille des recherches"},
         {"command": "resume", "description": "Reprendre la veille des recherches"},
@@ -535,10 +544,11 @@ def _libelle_etats(status):
 
 
 def _avec_retour(rows, step):
-    """Ajoute la ligne ⬅️ Retour sous un clavier inline (sauf à la toute 1re étape)."""
+    """Ajoute Annuler à chaque étape et Retour sauf à la première."""
     rows = list(rows)
     if step != "waiting_query":
         rows.append([{"text": "⬅️ Retour", "callback_data": f"back_{step}"}])
+    rows.append([{"text": "❌ Annuler", "callback_data": "cancel_search"}])
     return {"inline_keyboard": rows}
 
 
@@ -613,7 +623,7 @@ def poser_etape(chat_id, step):
     """Affiche la question correspondant à une étape (utilisé en avançant ET en revenant en arrière)."""
     state = user_states.get(chat_id) or {}
     if step == "waiting_query":
-        envoyer_message(chat_id, "🔍 Quel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)")
+        envoyer_message(chat_id, "🔍 What item would you like to find? (e.g. `nike tn`, `carhartt`)" if langue_utilisateur(chat_id) == "en" else "🔍 Quel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)", reply_markup=_avec_retour([], step))
     elif step == "waiting_min_price":
         envoyer_message(chat_id, "💰 Entre le *Prix Min* (ex: `10` ou `0` pour ignorer).", reply_markup=_avec_retour([], step))
     elif step == "waiting_max_price":
@@ -804,6 +814,13 @@ def _gerer_callback_assistant(callback, chat_id, data_callback):
     step = state.get("step")
 
     # --- ⬅️ Retour ---
+    if data_callback == "cancel_search":
+        repondre()
+        _maj_boutons(chat_id, message_id, {"inline_keyboard": []})
+        del user_states[chat_id]
+        envoyer_message(chat_id, "❌ Search creation cancelled." if langue_utilisateur(chat_id) == "en" else "❌ Création de recherche annulée.")
+        return
+
     if data_callback.startswith("back_"):
         if data_callback[len("back_"):] != step:  # bouton d'un ancien message
             repondre("↩️ Ce bouton n'est plus actif.")
@@ -882,7 +899,7 @@ def gerer_callback_query(callback):
         return
 
     # Idem pour ⬅️ Retour et les sélections multiples de l'assistant /newsearch.
-    if data_callback.startswith(("back_", "tsz", "tst")):
+    if data_callback.startswith(("back_", "tsz", "tst", "cancel_search")):
         _gerer_callback_assistant(callback, chat_id, data_callback)
         return
 
@@ -936,7 +953,8 @@ def gerer_callback_query(callback):
 
     elif data_callback == "restart_search":
         user_states[chat_id] = {"step": "waiting_query", "history": []}
-        envoyer_message(chat_id, "🔄 Pas de souci, recommençons.\n\n🔍 Quel article souhaites-tu rechercher ?")
+        envoyer_message(chat_id, "🔄 No problem, let's start again." if langue_utilisateur(chat_id) == "en" else "🔄 Pas de souci, recommençons.")
+        poser_etape(chat_id, "waiting_query")
 
     elif data_callback.startswith("warn_"):
         state = user_states.get(chat_id)
@@ -957,7 +975,7 @@ def gerer_callback_query(callback):
 
 def gerer_assistant_recherche(chat_id, text, state):
     step = state["step"]
-    if text.lower() in ["/cancel", "/stop", "annuler"]:
+    if text.lower() in ["/stop", "annuler"]:
         del user_states[chat_id]
         envoyer_message(chat_id, "❌ Action annulée.")
         return
@@ -1057,14 +1075,16 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
                     envoyer_message(chat_id, f"🎁 Tu as été parrainé ! +{REFERRAL_BONUS_DAYS} jour(s) de Premium offerts.")
                     envoyer_message(referrer_id, f"🎉 Un ami a rejoint VintedPulse grâce à ton lien ! +{REFERRAL_BONUS_DAYS} jour(s) de Premium offerts.")
 
-        envoyer_message(
-            chat_id,
-            "🤖 *Bienvenue sur VintedPulse Bot !*\n\nTon compte est actif et connecté. Tape `/newsearch` pour créer ta première alerte de veille.",
-            reply_markup=clavier_principal(),
-        )
+        en = langue_utilisateur(chat_id) == "en"
+        bienvenue = ("🤖 *Welcome to VintedPulse Bot!*\n\nYour account is active and connected. "
+                     "Use `/newsearch` to create your first alert.\n\n" if en else
+                     "🤖 *Bienvenue sur VintedPulse Bot !*\n\nTon compte est actif et connecté. "
+                     "Utilise `/recherche` pour créer ta première alerte.\n\n")
+        envoyer_message(chat_id, bienvenue + aide_message(chat_id), reply_markup=clavier_principal(chat_id))
         return
 
-    if text == "/newsearch":
+    en = langue_utilisateur(chat_id) == "en"
+    if text == ("/newsearch" if en else "/recherche"):
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT is_premium FROM users WHERE chat_id = ?", (chat_id,))
@@ -1090,13 +1110,21 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
             return
 
         user_states[chat_id] = {"step": "waiting_query", "history": []}
-        envoyer_message(chat_id, "🔍 *Nouvelle Recherche Vinted*\n\nQuel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)")
+        envoyer_message(chat_id,
+            "🔍 *New Vinted Search*\n\nWhat item would you like to find? (e.g. `nike tn`, `carhartt`)" if en else "🔍 *Nouvelle recherche Vinted*\n\nQuel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)",
+            reply_markup=_avec_retour([], "waiting_query"))
         return
 
     if text in ["/disconnect", "/unlink"]:
         with get_connection() as conn:
             conn.execute("UPDATE users SET is_linked = 0 WHERE chat_id = ?", (chat_id,))
         envoyer_message(chat_id, "🔌 *Compte dissocié avec succès !*")
+        return
+
+    if text == "/deleteaccount":
+        supprimer_utilisateur_complet(chat_id)
+        user_states.pop(chat_id, None)
+        envoyer_message(chat_id, "🗑️ Toutes tes données et recherches ont été supprimées définitivement.")
         return
 
     if text in ["/delete", "/supprimer"]:
@@ -1115,14 +1143,6 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         with get_connection() as conn:
             conn.execute("DELETE FROM searches WHERE chat_id = ?", (chat_id,))
         envoyer_message(chat_id, "🛑 **Toutes vos recherches ont été arrêtées et supprimées d'un coup !**")
-        return
-
-    if text == "/cancel":
-        if chat_id in user_states:
-            del user_states[chat_id]
-            envoyer_message(chat_id, "❌ Création de recherche annulée.")
-        else:
-            envoyer_message(chat_id, "ℹ️ Aucune action en cours à annuler.")
         return
 
     if text in ["/list", "/mes-recherches"]:
@@ -1269,13 +1289,33 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         return
 
     if text in ["/help", "/aide"]:
-        aide_msg = (
+        envoyer_message(chat_id, aide_message(chat_id), reply_markup=clavier_principal(chat_id))
+        return
+
+
+def aide_message(chat_id):
+    if langue_utilisateur(chat_id) == "en":
+        return (
+            "🛠️ *Help - VintedPulse*\n\n"
+            "• `/newsearch`: Create an alert step by step.\n"
+            "• `/list`: View your searches.\n"
+            "• `/delete`: Delete a search.\n"
+            "• `/stop`: Stop all searches.\n"
+            "• `/pause` / `/resume`: Pause / resume monitoring.\n"
+            "• `/watch <link>`: Add an item to the wishlist.\n"
+            "• `/wishlist`: View/manage your wishlist.\n"
+            "• `/trackseller <username>`: Follow a seller.\n"
+            "• `/sellers`: View/manage followed sellers.\n"
+            "• `/parrain`: Your referral link.\n"
+            "• `/disconnect`: Disconnect your account.\n"
+            "• `/feedback`: Suggest an idea."
+        )
+    return (
             "🛠️ *Aide - VintedPulse*\n\n"
-            "• `/newsearch` : Créer une alerte pas à pas.\n"
+            "• `/recherche` : Créer une alerte pas à pas.\n"
             "• `/list` : Vos recherches.\n"
             "• `/delete` : Supprimer une recherche.\n"
             "• `/stop` : Tout stopper d'un coup.\n"
-            "• `/cancel` : Annuler la création en cours.\n"
             "• `/pause` / `/resume` : Mettre en pause / reprendre la veille.\n"
             "• `/watch <lien>` : Ajouter une annonce à la wishlist.\n"
             "• `/wishlist` : Voir/gérer ta wishlist.\n"
@@ -1285,8 +1325,6 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
             "• `/disconnect` : Dissocier le compte.\n"
             "• `/feedback` : Suggérer une idée."
         )
-        envoyer_message(chat_id, aide_msg, reply_markup=clavier_principal())
-        return
 
 
 def ecouter_telegram():
