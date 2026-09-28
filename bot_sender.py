@@ -66,6 +66,7 @@ def clavier_principal(chat_id=None):
     return {
         "keyboard": [
             (["🔍 New search", "📋 Manage searches"] if en else ["🔍 Nouvelle recherche", "📋 Gérer mes recherches"]),
+            (["🔍 New search", "📋 My searches"] if en else ["🔍 Nouvelle recherche", "📋 Mes recherches"]),
             (["⏸️ Pause", "▶️ Resume"] if en else ["⏸️ Pause", "▶️ Reprendre"]),
             ["❤️ Wishlist", "🕵️ Vendeurs suivis"],
             ["📊 Stats", "🎁 Parrainage"],
@@ -84,6 +85,7 @@ REPLY_KEYBOARD_MAP = {
     "📋 Manage searches": "/list",
     "⚙️ Préférences": "/preferences",
     "⚙️ Preferences": "/preferences",
+    "📋 My searches": "/list",
     "⏸️ Pause": "/pause",
     "▶️ Reprendre": "/resume",
     "▶️ Resume": "/resume",
