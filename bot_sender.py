@@ -1,26 +1,19 @@
 import re
 import time
-import random
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
 
 from config import (
     URL_TELEGRAM_SENDER, URL_TELEGRAM_DEV, DEV_CHAT_ID, SENDER_BOT_USERNAME,
-    FREE_PLAN_MAX_SEARCHES, MONITOR_CYCLE_SECONDS, DELAY_BETWEEN_SEARCHES,
-    MAX_SEND_FAILURES_BEFORE_AUTOPAUSE, MONITOR_MAX_WORKERS,
-    HEALTHCHECK_URL, DATA_RETENTION_DAYS, PURGE_INTERVAL_SECONDS,
-    REAL_DEAL_THRESHOLD, REAL_DEAL_MIN_SAMPLES, REFERRAL_BONUS_DAYS,
+    FREE_PLAN_MAX_SEARCHES, REFERRAL_BONUS_DAYS,
 )
 from db import (
     init_db, get_connection, upsert_user, get_user, supprimer_utilisateur_complet,
-    credit_referral, purger_premium_expire, maj_stats_prix_recherche,
+    credit_referral,
     ajouter_veille_vendeur, lister_veilles_vendeur, supprimer_veille_vendeur,
-    toutes_les_veilles_vendeur_actives,
-    ajouter_wishlist, lister_wishlist, supprimer_wishlist, toute_la_wishlist, maj_prix_wishlist,
-    purger_anciennes_donnees, get_plage_horaire, heure_dans_plage,
+    ajouter_wishlist, lister_wishlist, supprimer_wishlist,
     creer_carousel, get_carousel,
 )
 from telegram_utils import (
@@ -31,11 +24,13 @@ from telegram_utils import (
 )
 from vinted_scraper import chercher_vinted, chercher_items_vendeur, resoudre_vendeur, obtenir_prix_item
 from logger_config import get_logger
+from monitor_service import MonitorService, filter_duplicates_and_price_drops, filter_excluded_keywords
 
 logger = get_logger("bot_sender")
 
 app = FastAPI()
 user_states = {}
+shutdown_event = threading.Event()
 
 
 # Wrappers liés au token du bot sender, pour garder le reste du fichier simple
@@ -123,87 +118,6 @@ def definir_commandes_sender():
 @app.get("/")
 def root():
     return {"status": "running", "mode": "VintedPulse Sender Bot SaaS"}
-
-
-def _parse_prix(prix_str):
-    try:
-        return float(str(prix_str).replace("€", "").replace(" ", "").replace(",", "."))
-    except (ValueError, AttributeError):
-        return 0.0
-
-
-def _filtrer_mots_exclus(items, exclude_keywords):
-    if not exclude_keywords or not items:
-        return items
-    mots = [m.strip().lower() for m in exclude_keywords.split(",") if m.strip()]
-    if not mots:
-        return items
-    return [it for it in items if not any(m in it["titre"].lower() for m in mots)]
-
-
-def filtrer_doublons_et_baisses(chat_id, items):
-    if not items:
-        return [], []
-    nouveaux, baisses = [], []
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        for item in items:
-            prix_clean = _parse_prix(item["prix"])
-
-            cursor.execute("SELECT id FROM seen_items WHERE chat_id = ? AND item_url = ?", (chat_id, item["lien"]))
-            deja_vu = cursor.fetchone()
-            cursor.execute("SELECT price_value FROM item_prices WHERE chat_id = ? AND item_url = ?", (chat_id, item["lien"]))
-            row_price = cursor.fetchone()
-
-            if not deja_vu:
-                cursor.execute(
-                    "INSERT INTO seen_items (chat_id, item_url, created_at) VALUES (?, ?, datetime('now'))",
-                    (chat_id, item["lien"]),
-                )
-                if not row_price:
-                    cursor.execute(
-                        "INSERT INTO item_prices (chat_id, item_url, price_value, created_at) VALUES (?, ?, ?, datetime('now'))",
-                        (chat_id, item["lien"], prix_clean),
-                    )
-                nouveaux.append(item)
-            elif row_price:
-                old_price = row_price[0]
-                if prix_clean > 0 and old_price > 0 and prix_clean < old_price:
-                    baisses.append({
-                        "titre": item["titre"], "ancien_prix": old_price,
-                        "nouveau_prix": item["prix"], "lien": item["lien"], "image": item["image"],
-                    })
-                    cursor.execute(
-                        "UPDATE item_prices SET price_value = ? WHERE chat_id = ? AND item_url = ?",
-                        (prix_clean, chat_id, item["lien"]),
-                    )
-    return nouveaux, baisses
-
-
-def _signaler_echec_envoi(chat_id):
-    """Compte les échecs Telegram consécutifs ; au-delà du seuil, met les recherches en pause
-    automatiquement (utilisateur qui a probablement bloqué le bot) au lieu de continuer à
-    scraper Vinted pour rien indéfiniment."""
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET consecutive_send_failures = consecutive_send_failures + 1 WHERE chat_id = ?", (chat_id,))
-        cursor.execute("SELECT consecutive_send_failures FROM users WHERE chat_id = ?", (chat_id,))
-        row = cursor.fetchone()
-        if row and row[0] >= MAX_SEND_FAILURES_BEFORE_AUTOPAUSE:
-            cursor.execute("UPDATE searches SET is_paused = 1 WHERE chat_id = ?", (chat_id,))
-            logger.warning(f"Utilisateur {chat_id} injoignable : recherches mises en pause automatiquement.")
-
-
-def _signaler_succes_envoi(chat_id):
-    with get_connection() as conn:
-        conn.execute("UPDATE users SET consecutive_send_failures = 0 WHERE chat_id = ?", (chat_id,))
-
-
-def _apres_envoi(chat_id, ok):
-    if ok:
-        _signaler_succes_envoi(chat_id)
-    else:
-        _signaler_echec_envoi(chat_id)
 
 
 def _echapper_markdown(texte):
@@ -332,8 +246,7 @@ def envoyer_alerte_telegram(chat_id, items):
         else:
             message = f"{badge}🚨 *{_echapper_markdown(item['titre'])}* - 💰 {item['prix']}\n[👉 Voir l'annonce]({item['lien']})"
             ok = envoyer_message(chat_id, message)
-        _apres_envoi(chat_id, ok)
-        return
+        return ok
 
     avec_image = [i for i in items if i.get("image")]
     sans_image = [i for i in items if not i.get("image")]
@@ -352,142 +265,7 @@ def envoyer_alerte_telegram(chat_id, items):
 
     if a_lister:
         resultats.append(_envoyer_liste_texte(chat_id, a_lister, entete))
-    _apres_envoi(chat_id, all(resultats))
-
-
-def _traiter_une_recherche(row):
-    search_id, chat_id, query, min_price, max_price, size, status, limit_count, exclude_keywords = row
-    time.sleep(random.uniform(0, DELAY_BETWEEN_SEARCHES))  # évite une rafale de requêtes simultanées vers Vinted
-
-    resultats = chercher_vinted(query, min_price, max_price, size, status, limit_count)
-    resultats = _filtrer_mots_exclus(resultats, exclude_keywords)
-    nouveaux, baisses = filtrer_doublons_et_baisses(chat_id, resultats)
-
-    # Détection de "vraie" bonne affaire : compare le prix de chaque nouvel
-    # article à la moyenne mobile des prix vus pour CETTE recherche (et pas
-    # juste "moins cher qu'avant" comme la détection de baisse ci-dessous).
-    for item in nouveaux:
-        prix_float = _parse_prix(item["prix"])
-        avg_avant, count_avant = (None, 0)
-        if prix_float:
-            avg_avant, count_avant = maj_stats_prix_recherche(search_id, prix_float)
-        item["bonne_affaire"] = bool(
-            prix_float and avg_avant and count_avant >= REAL_DEAL_MIN_SAMPLES
-            and prix_float < REAL_DEAL_THRESHOLD * avg_avant
-        )
-
-    if nouveaux:
-        envoyer_alerte_telegram(chat_id, nouveaux)
-
-    for b in baisses:
-        msg = (
-            f"📉 *BAISSE DE PRIX DÉTECTÉE !*\n\n🚨 **{b['titre']}**\n"
-            f"💰 Ancien : {b['ancien_prix']}€ ➡️ **Nouveau : {b['nouveau_prix']}**\n"
-            f"[👉 Saisir l'affaire]({b['lien']})"
-        )
-        if b.get("image"):
-            envoyer_photo(chat_id, b["image"], msg)
-        else:
-            envoyer_message(chat_id, msg)
-
-
-def _traiter_une_veille_vendeur(row):
-    """⚠️ Repose sur des endpoints Vinted non testés en conditions réelles
-    (voir vinted_scraper.py) : à valider avant de compter dessus en prod."""
-    watch_id, chat_id, seller_id, seller_label, limit_count = row
-    time.sleep(random.uniform(0, DELAY_BETWEEN_SEARCHES))
-
-    resultats = chercher_items_vendeur(seller_id, limit_count)
-    nouveaux, _ = filtrer_doublons_et_baisses(chat_id, resultats)
-    if nouveaux:
-        for item in nouveaux:
-            item["titre"] = f"[👤 {seller_label}] {item['titre']}"
-        envoyer_alerte_telegram(chat_id, nouveaux)
-
-
-def _verifier_wishlist():
-    """⚠️ Repose sur obtenir_prix_item(), non testé en conditions réelles."""
-    for item_id, chat_id, item_url, titre, prix_dernier in toute_la_wishlist():
-        try:
-            titre_actuel, prix_actuel = obtenir_prix_item(item_url)
-        except Exception as e:
-            logger.error(f"Erreur vérif wishlist item {item_id} : {e}")
-            continue
-        if prix_actuel is None:
-            continue
-        if prix_dernier and prix_actuel < prix_dernier:
-            envoyer_message(
-                chat_id,
-                f"❤️📉 *Baisse de prix sur ta wishlist !*\n\n**{titre or titre_actuel}**\n"
-                f"💰 {prix_dernier}€ ➡️ **{prix_actuel}€**\n[👉 Voir l'annonce]({item_url})",
-            )
-        if prix_actuel != prix_dernier:
-            maj_prix_wishlist(item_id, prix_actuel)
-
-
-def _pinger_heartbeat():
-    """Ping périodique vers un service externe (ex: healthchecks.io) : si le
-    bot plante ou reste bloqué, une alerte part automatiquement au bout du
-    délai configuré côté service, au lieu de le découvrir au hasard."""
-    if not HEALTHCHECK_URL:
-        return
-    try:
-        requests.get(HEALTHCHECK_URL, timeout=10)
-    except Exception as e:
-        logger.warning(f"Heartbeat : échec du ping ({e})")
-
-
-def _dans_la_plage_horaire():
-    """La plage est relue à chaque cycle depuis la base : la commande dev
-    /plage la modifie à chaud, sans redémarrer le bot."""
-    debut, fin = get_plage_horaire()
-    return heure_dans_plage(time.localtime().tm_hour, debut, fin)
-
-
-_last_purge_ts = 0
-
-
-def background_monitor():
-    global _last_purge_ts
-    while True:
-        try:
-            purger_premium_expire()
-
-            if time.time() - _last_purge_ts > PURGE_INTERVAL_SECONDS:
-                n = purger_anciennes_donnees(DATA_RETENTION_DAYS)
-                if n:
-                    logger.info(f"Purge auto : {n} ligne(s) supprimée(s) (> {DATA_RETENTION_DAYS} jours).")
-                _last_purge_ts = time.time()
-
-            if _dans_la_plage_horaire():
-                with get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT id, chat_id, query, min_price, max_price, size, status, limit_count, exclude_keywords "
-                        "FROM searches WHERE is_paused = 0"
-                    )
-                    surveillances = cursor.fetchall()
-
-                # Quelques recherches traitées en parallèle : la veille reste réactive
-                # même avec plusieurs dizaines d'utilisateurs, sans surcharger Vinted.
-                with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
-                    list(executor.map(_traiter_une_recherche, surveillances))
-
-                veilles_vendeur = toutes_les_veilles_vendeur_actives()
-                if veilles_vendeur:
-                    with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
-                        list(executor.map(_traiter_une_veille_vendeur, veilles_vendeur))
-
-                _verifier_wishlist()
-            else:
-                debut, fin = get_plage_horaire()
-                logger.info(f"Hors plage horaire de veille ({debut}h-{fin}h) : cycle sauté.")
-
-            _pinger_heartbeat()
-
-        except Exception as e:
-            logger.error(f"Erreur moniteur : {e}")
-        time.sleep(MONITOR_CYCLE_SECONDS)
+    return all(resultats)
 
 
 def _envoyer_apercu_immediat(chat_id, query, min_p, max_p, size, status, limit_count, exclude_keywords):
@@ -497,15 +275,15 @@ def _envoyer_apercu_immediat(chat_id, query, min_p, max_p, size, status, limit_c
     try:
         apercu_limit = min(limit_count, 3)
         resultats = chercher_vinted(query, min_p, max_p, size, status, apercu_limit)
-        resultats = _filtrer_mots_exclus(resultats, exclude_keywords)
-        nouveaux, _ = filtrer_doublons_et_baisses(chat_id, resultats)
+        resultats = filter_excluded_keywords(resultats, exclude_keywords)
+        nouveaux, _ = filter_duplicates_and_price_drops(chat_id, resultats)
         if nouveaux:
             envoyer_message(chat_id, f"🔍 *Aperçu immédiat* — {len(nouveaux)} exemple(s) de ce que tu vas recevoir :")
             envoyer_alerte_telegram(chat_id, nouveaux)
         else:
             envoyer_message(chat_id, "🔍 Aperçu immédiat : rien à montrer pour l'instant, mais la veille continue en arrière-plan.")
-    except Exception as e:
-        logger.error(f"Erreur aperçu immédiat pour {chat_id} : {e}")
+    except Exception:
+        logger.exception("Immediate preview failed for %s", chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,9 +1044,9 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         # pour n'être alerté que des NOUVELLES annonces (et pas de tout le
         # catalogue existant au premier cycle).
         try:
-            filtrer_doublons_et_baisses(chat_id, chercher_items_vendeur(seller_id, 96))
-        except Exception as e:
-            logger.error(f"Baseline vendeur {seller_id} impossible : {e}")
+            filter_duplicates_and_price_drops(chat_id, chercher_items_vendeur(seller_id, 96))
+        except Exception:
+            logger.exception("Seller baseline failed for %s", seller_id)
         envoyer_message(chat_id, f"🕵️ Veille activée sur le vendeur **{label or identifiant}** ! Tu seras alerté de ses nouvelles annonces.")
         return
 
@@ -1327,12 +1105,13 @@ def aide_message(chat_id):
         )
 
 
-def ecouter_telegram():
+def ecouter_telegram(stop_event=None):
+    stop_event = stop_event or shutdown_event
     envoyer_requete(URL_TELEGRAM_SENDER, "deleteWebhook?drop_pending_updates=true", {})
 
     offset = 0
     logger.info("🤖 Bot Sender (@VintedPulseBot) 100% opérationnel...")
-    while True:
+    while not stop_event.is_set():
         try:
             response = requests.get(URL_TELEGRAM_SENDER + f"getUpdates?offset={offset}&timeout=30", timeout=35)
             data = response.json()
@@ -1351,16 +1130,24 @@ def ecouter_telegram():
                             gerer_assistant_recherche(chat_id, text, user_states[chat_id])
                         else:
                             gerer_commandes_texte(chat_id, text, message_from)
-        except Exception as e:
-            logger.error(f"Erreur polling sender : {e}")
-            time.sleep(5)
+        except Exception:
+            # A malformed Telegram update or one handler must not stop polling.
+            logger.exception("Sender polling failed; retrying in five seconds.")
+            stop_event.wait(5)
+
+
+@app.on_event("shutdown")
+def stop_background_workers():
+    """Let polling and monitoring leave their loops cleanly on server stop."""
+    shutdown_event.set()
 
 
 if __name__ == "__main__":
     init_db()
     definir_commandes_sender()
-    threading.Thread(target=ecouter_telegram, daemon=True).start()
-    threading.Thread(target=background_monitor, daemon=True).start()
+    threading.Thread(target=ecouter_telegram, args=(shutdown_event,), daemon=True, name="telegram-polling").start()
+    monitor = MonitorService(envoyer_alerte_telegram, envoyer_message, envoyer_photo)
+    threading.Thread(target=monitor.run_forever, args=(shutdown_event,), daemon=True, name="search-monitor").start()
 
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)

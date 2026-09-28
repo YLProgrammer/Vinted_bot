@@ -26,6 +26,7 @@ def get_connection():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=10000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     try:
         yield conn
         conn.commit()
@@ -86,6 +87,15 @@ DATE_SENTINELLE = "2000-01-01 00:00:00"
 def init_db():
     with get_connection() as conn:
         cursor = conn.cursor()
+        # This registry makes schema upgrades observable and idempotent.  The
+        # additive migrations below intentionally support databases created by
+        # every earlier release.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 chat_id TEXT PRIMARY KEY,
@@ -247,6 +257,18 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_carousels_chat_created ON carousels(chat_id, created_at)",
         ):
             cursor.execute(statement)
+
+        # Version 1 represents the complete additive schema above.  Inserting
+        # it only after all statements succeed prevents a half-applied upgrade
+        # from being marked as completed.
+        cursor.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)")
+
+
+def get_schema_version():
+    """Return the latest successfully applied DB schema version."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    return row[0] or 0
 
 
 def upsert_user(chat_id, first_name=None, username=None, is_linked=None):
