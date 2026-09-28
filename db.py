@@ -74,6 +74,7 @@ COLONNES_ATTENDUES = {
         ("size", "TEXT"), ("size_label", "TEXT"), ("status", "TEXT"),
         ("limit_count", "INTEGER DEFAULT 20"), ("is_paused", "INTEGER DEFAULT 0"),
         ("exclude_keywords", "TEXT"),
+        ("notification_mode", "TEXT DEFAULT 'instant'"),
     ],
     "seen_items": [("item_url", "TEXT")],
     "item_prices": [("item_url", "TEXT"), ("price_value", "REAL")],

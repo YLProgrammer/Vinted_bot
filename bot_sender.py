@@ -65,11 +65,12 @@ def clavier_principal(chat_id=None):
     en = chat_id is not None and langue_utilisateur(chat_id) == "en"
     return {
         "keyboard": [
+            (["🔍 New search", "📋 Manage searches"] if en else ["🔍 Nouvelle recherche", "📋 Gérer mes recherches"]),
             (["🔍 New search", "📋 My searches"] if en else ["🔍 Nouvelle recherche", "📋 Mes recherches"]),
             (["⏸️ Pause", "▶️ Resume"] if en else ["⏸️ Pause", "▶️ Reprendre"]),
             ["❤️ Wishlist", "🕵️ Vendeurs suivis"],
             ["📊 Stats", "🎁 Parrainage"],
-            ["💡 Feedback", "🛠️ Aide"],
+            ["⚙️ Preferences", "🛠️ Help"] if en else ["⚙️ Préférences", "🛠️ Aide"],
         ],
         "resize_keyboard": True,
     }
@@ -79,6 +80,11 @@ REPLY_KEYBOARD_MAP = {
     "🔍 Nouvelle recherche": "/recherche",
     "🔍 New search": "/newsearch",
     "📋 Mes recherches": "/list",
+    "📋 Gérer mes recherches": "/list",
+    "📋 My searches": "/list",
+    "📋 Manage searches": "/list",
+    "⚙️ Préférences": "/preferences",
+    "⚙️ Preferences": "/preferences",
     "📋 My searches": "/list",
     "⏸️ Pause": "/pause",
     "▶️ Reprendre": "/resume",
@@ -480,11 +486,16 @@ def finaliser_creation_recherche(chat_id):
             del user_states[chat_id]
             return
 
-        cursor.execute(
-            "INSERT INTO searches (chat_id, query, min_price, max_price, size, size_label, status, limit_count, is_paused, exclude_keywords) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-            (chat_id, q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords),
-        )
+        if state.get("editing_search_id"):
+            cursor.execute(
+                "UPDATE searches SET query=?, min_price=?, max_price=?, size=?, size_label=?, status=?, limit_count=?, exclude_keywords=? WHERE id=? AND chat_id=?",
+                (q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords, state["editing_search_id"], chat_id),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO searches (chat_id, query, min_price, max_price, size, size_label, status, limit_count, is_paused, exclude_keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (chat_id, q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords),
+            )
 
     exclude_txt = f"🚫 Exclu : `{exclude_keywords}`\n" if exclude_keywords else ""
     resume_msg = (
@@ -683,7 +694,42 @@ def gerer_callback_query(callback):
 
     envoyer_requete(URL_TELEGRAM_SENDER, "answerCallbackQuery", {"callback_query_id": query_id})
 
-    if data_callback.startswith("del_"):
+    if data_callback.startswith("manage_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            row = conn.execute("SELECT id, query, is_paused FROM searches WHERE id=? AND chat_id=?", (search_id, chat_id)).fetchone()
+        if not row:
+            return
+        en = langue_utilisateur(chat_id) == "en"
+        status = "paused" if row[2] else "active"
+        keyboard = [[{"text": "▶️ Resume" if row[2] else "⏸️ Pause", "callback_data": f"toggle_{search_id}"}, {"text": "✏️ Edit", "callback_data": f"edit_{search_id}"}], [{"text": "🗑️ Delete", "callback_data": f"del_{search_id}"}]]
+        envoyer_message(chat_id, (f"🔍 *{row[1]}* — {status}" if en else f"🔍 *{row[1]}* — {'en pause' if row[2] else 'active'}"), reply_markup={"inline_keyboard": keyboard})
+    elif data_callback.startswith("toggle_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            conn.execute("UPDATE searches SET is_paused = 1 - is_paused WHERE id=? AND chat_id=?", (search_id, chat_id))
+        envoyer_message(chat_id, "✅ Search status updated." if langue_utilisateur(chat_id) == "en" else "✅ Statut de la recherche mis à jour.")
+    elif data_callback.startswith("edit_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            row = conn.execute("SELECT query,min_price,max_price,size,size_label,status,limit_count,exclude_keywords FROM searches WHERE id=? AND chat_id=?", (search_id, chat_id)).fetchone()
+        if not row:
+            return
+        user_states[chat_id] = {"step":"waiting_query", "history":[], "editing_search_id":search_id, "query":row[0], "min_price":row[1], "max_price":row[2], "size":row[3], "size_label":row[4], "status":row[5], "limit_count":row[6], "exclude_keywords":row[7]}
+        envoyer_message(chat_id, (f"✏️ Editing *{row[0]}*. Send the new keyword (or send the same one)." if langue_utilisateur(chat_id)=="en" else f"✏️ Modification de *{row[0]}*. Envoie le nouveau mot-clé (ou le même)."), reply_markup=_avec_retour([], "waiting_query"))
+    elif data_callback.startswith("lang_"):
+        language = data_callback.rsplit("_", 1)[1]
+        if language in ("fr", "en"):
+            with get_connection() as conn:
+                conn.execute("UPDATE users SET language=? WHERE chat_id=?", (language, chat_id))
+            envoyer_message(chat_id, "✅ Language updated." if language == "en" else "✅ Langue mise à jour.", reply_markup=clavier_principal(chat_id))
+    elif data_callback.startswith("notify_"):
+        mode = data_callback.rsplit("_", 1)[1]
+        if mode in ("instant", "quiet"):
+            with get_connection() as conn:
+                conn.execute("UPDATE searches SET notification_mode=? WHERE chat_id=?", (mode, chat_id))
+            envoyer_message(chat_id, "✅ Notification preference updated." if langue_utilisateur(chat_id)=="en" else "✅ Préférence de notification mise à jour.")
+    elif data_callback.startswith("del_"):
         search_id = data_callback.split("_")[1]
         with get_connection() as conn:
             conn.execute("DELETE FROM searches WHERE id = ? AND chat_id = ?", (search_id, chat_id))
@@ -927,7 +973,7 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT query, min_price, max_price, size_label, limit_count, exclude_keywords, is_paused, status "
+                "SELECT id, query, min_price, max_price, size_label, limit_count, exclude_keywords, is_paused, status "
                 "FROM searches WHERE chat_id = ?",
                 (chat_id,),
             )
@@ -935,14 +981,20 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         if queries:
             msg = "📋 *Vos recherches actives :*\n"
             for q in queries:
-                label_taille = q[3] if q[3] else "Toutes"
-                excl_txt = f" | 🚫 {q[5]}" if q[5] else ""
-                pause_txt = " ⏸️" if q[6] else ""
-                etat_txt = f" | État: {_libelle_etats(q[7])}" if q[7] else ""
-                msg += f"• `{q[0]}` (Prix: {q[1] or '0'}€-{q[2] or 'Max'}€ | Taille: {label_taille}{etat_txt} | Échantillon: {q[4]}{excl_txt}){pause_txt}\n"
+                label_taille = q[4] if q[4] else "Toutes"
+                excl_txt = f" | 🚫 {q[6]}" if q[6] else ""
+                pause_txt = " ⏸️" if q[7] else ""
+                etat_txt = f" | État: {_libelle_etats(q[8])}" if q[8] else ""
+                msg += f"• `{q[1]}` (Prix: {q[2] or '0'}€-{q[3] or 'Max'}€ | Taille: {label_taille}{etat_txt} | Échantillon: {q[5]}{excl_txt}){pause_txt}\n"
         else:
             msg = "Aucune recherche active."
-        envoyer_message(chat_id, msg)
+        keyboard = [[{"text": f"⚙️ {q[1][:35]}", "callback_data": f"manage_{q[0]}"}] for q in queries] if queries else None
+        envoyer_message(chat_id, msg, reply_markup={"inline_keyboard": keyboard} if keyboard else None)
+        return
+
+    if text in ["/preferences", "/language"]:
+        en = langue_utilisateur(chat_id) == "en"
+        envoyer_message(chat_id, "⚙️ Preferences" if en else "⚙️ Préférences", reply_markup={"inline_keyboard":[[{"text":"🇫🇷 Français","callback_data":"lang_fr"},{"text":"🇬🇧 English","callback_data":"lang_en"}],[{"text":"🔔 Instant","callback_data":"notify_instant"},{"text":"🌙 Quiet","callback_data":"notify_quiet"}]]})
         return
 
     if text == "/pause":
