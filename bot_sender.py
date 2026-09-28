@@ -1,26 +1,19 @@
 import re
 import time
-import random
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
 
 from config import (
     URL_TELEGRAM_SENDER, URL_TELEGRAM_DEV, DEV_CHAT_ID, SENDER_BOT_USERNAME,
-    FREE_PLAN_MAX_SEARCHES, MONITOR_CYCLE_SECONDS, DELAY_BETWEEN_SEARCHES,
-    MAX_SEND_FAILURES_BEFORE_AUTOPAUSE, MONITOR_MAX_WORKERS,
-    HEALTHCHECK_URL, DATA_RETENTION_DAYS, PURGE_INTERVAL_SECONDS,
-    REAL_DEAL_THRESHOLD, REAL_DEAL_MIN_SAMPLES, REFERRAL_BONUS_DAYS,
+    FREE_PLAN_MAX_SEARCHES, REFERRAL_BONUS_DAYS,
 )
 from db import (
-    init_db, get_connection, upsert_user, get_user,
-    credit_referral, purger_premium_expire, maj_stats_prix_recherche,
+    init_db, get_connection, upsert_user, get_user, supprimer_utilisateur_complet,
+    credit_referral,
     ajouter_veille_vendeur, lister_veilles_vendeur, supprimer_veille_vendeur,
-    toutes_les_veilles_vendeur_actives,
-    ajouter_wishlist, lister_wishlist, supprimer_wishlist, toute_la_wishlist, maj_prix_wishlist,
-    purger_anciennes_donnees, get_plage_horaire, heure_dans_plage,
+    ajouter_wishlist, lister_wishlist, supprimer_wishlist,
     creer_carousel, get_carousel,
 )
 from telegram_utils import (
@@ -31,11 +24,13 @@ from telegram_utils import (
 )
 from vinted_scraper import chercher_vinted, chercher_items_vendeur, resoudre_vendeur, obtenir_prix_item
 from logger_config import get_logger
+from monitor_service import MonitorService, filter_duplicates_and_price_drops, filter_excluded_keywords
 
 logger = get_logger("bot_sender")
 
 app = FastAPI()
 user_states = {}
+shutdown_event = threading.Event()
 
 
 # Wrappers liés au token du bot sender, pour garder le reste du fichier simple
@@ -61,24 +56,37 @@ def editer_photo(chat_id, message_id, photo_url, caption, reply_markup=None, par
 
 
 # --- Clavier persistant (visible en permanence sous la zone de texte) ---
-def clavier_principal():
+def langue_utilisateur(chat_id):
+    user = get_user(chat_id)
+    return user.get("language") if user and user.get("language") in ("fr", "en") else "fr"
+
+
+def clavier_principal(chat_id=None):
+    en = chat_id is not None and langue_utilisateur(chat_id) == "en"
     return {
         "keyboard": [
-            ["🔍 Nouvelle recherche", "📋 Mes recherches"],
-            ["⏸️ Pause", "▶️ Reprendre"],
+            (["🔍 New search", "📋 Manage searches"] if en else ["🔍 Nouvelle recherche", "📋 Gérer mes recherches"]),
+            (["⏸️ Pause", "▶️ Resume"] if en else ["⏸️ Pause", "▶️ Reprendre"]),
             ["❤️ Wishlist", "🕵️ Vendeurs suivis"],
             ["📊 Stats", "🎁 Parrainage"],
-            ["💡 Feedback", "🛠️ Aide"],
+            ["⚙️ Preferences", "🛠️ Help"] if en else ["⚙️ Préférences", "🛠️ Aide"],
         ],
         "resize_keyboard": True,
     }
 
 
 REPLY_KEYBOARD_MAP = {
-    "🔍 Nouvelle recherche": "/newsearch",
+    "🔍 Nouvelle recherche": "/recherche",
+    "🔍 New search": "/newsearch",
     "📋 Mes recherches": "/list",
+    "📋 Gérer mes recherches": "/list",
+    "📋 My searches": "/list",
+    "📋 Manage searches": "/list",
+    "⚙️ Préférences": "/preferences",
+    "⚙️ Preferences": "/preferences",
     "⏸️ Pause": "/pause",
     "▶️ Reprendre": "/resume",
+    "▶️ Resume": "/resume",
     "❤️ Wishlist": "/wishlist",
     "🕵️ Vendeurs suivis": "/sellers",
     "📊 Stats": "/stats",
@@ -92,12 +100,12 @@ def definir_commandes_sender():
     commandes = [
         {"command": "help", "description": "Afficher l'aide complète"},
         {"command": "start", "description": "Démarrer et activer son compte VintedPulse"},
-        {"command": "newsearch", "description": "Créer une nouvelle alerte Vinted pas à pas"},
+        {"command": "recherche", "description": "Créer une nouvelle alerte Vinted pas à pas"},
         {"command": "list", "description": "Afficher vos recherches actives"},
         {"command": "delete", "description": "Supprimer une recherche spécifique"},
         {"command": "stop", "description": "🛑 Stopper et supprimer toutes les recherches"},
-        {"command": "cancel", "description": "Annuler la création de recherche en cours"},
         {"command": "disconnect", "description": "Dissocier ton compte"},
+        {"command": "deleteaccount", "description": "Supprimer toutes vos données"},
         {"command": "feedback", "description": "Suggérer une idée ou signaler un bug"},
         {"command": "pause", "description": "Mettre en pause la veille des recherches"},
         {"command": "resume", "description": "Reprendre la veille des recherches"},
@@ -114,87 +122,6 @@ def definir_commandes_sender():
 @app.get("/")
 def root():
     return {"status": "running", "mode": "VintedPulse Sender Bot SaaS"}
-
-
-def _parse_prix(prix_str):
-    try:
-        return float(str(prix_str).replace("€", "").replace(" ", "").replace(",", "."))
-    except (ValueError, AttributeError):
-        return 0.0
-
-
-def _filtrer_mots_exclus(items, exclude_keywords):
-    if not exclude_keywords or not items:
-        return items
-    mots = [m.strip().lower() for m in exclude_keywords.split(",") if m.strip()]
-    if not mots:
-        return items
-    return [it for it in items if not any(m in it["titre"].lower() for m in mots)]
-
-
-def filtrer_doublons_et_baisses(chat_id, items):
-    if not items:
-        return [], []
-    nouveaux, baisses = [], []
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        for item in items:
-            prix_clean = _parse_prix(item["prix"])
-
-            cursor.execute("SELECT id FROM seen_items WHERE chat_id = ? AND item_url = ?", (chat_id, item["lien"]))
-            deja_vu = cursor.fetchone()
-            cursor.execute("SELECT price_value FROM item_prices WHERE chat_id = ? AND item_url = ?", (chat_id, item["lien"]))
-            row_price = cursor.fetchone()
-
-            if not deja_vu:
-                cursor.execute(
-                    "INSERT INTO seen_items (chat_id, item_url, created_at) VALUES (?, ?, datetime('now'))",
-                    (chat_id, item["lien"]),
-                )
-                if not row_price:
-                    cursor.execute(
-                        "INSERT INTO item_prices (chat_id, item_url, price_value, created_at) VALUES (?, ?, ?, datetime('now'))",
-                        (chat_id, item["lien"], prix_clean),
-                    )
-                nouveaux.append(item)
-            elif row_price:
-                old_price = row_price[0]
-                if prix_clean > 0 and old_price > 0 and prix_clean < old_price:
-                    baisses.append({
-                        "titre": item["titre"], "ancien_prix": old_price,
-                        "nouveau_prix": item["prix"], "lien": item["lien"], "image": item["image"],
-                    })
-                    cursor.execute(
-                        "UPDATE item_prices SET price_value = ? WHERE chat_id = ? AND item_url = ?",
-                        (prix_clean, chat_id, item["lien"]),
-                    )
-    return nouveaux, baisses
-
-
-def _signaler_echec_envoi(chat_id):
-    """Compte les échecs Telegram consécutifs ; au-delà du seuil, met les recherches en pause
-    automatiquement (utilisateur qui a probablement bloqué le bot) au lieu de continuer à
-    scraper Vinted pour rien indéfiniment."""
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET consecutive_send_failures = consecutive_send_failures + 1 WHERE chat_id = ?", (chat_id,))
-        cursor.execute("SELECT consecutive_send_failures FROM users WHERE chat_id = ?", (chat_id,))
-        row = cursor.fetchone()
-        if row and row[0] >= MAX_SEND_FAILURES_BEFORE_AUTOPAUSE:
-            cursor.execute("UPDATE searches SET is_paused = 1 WHERE chat_id = ?", (chat_id,))
-            logger.warning(f"Utilisateur {chat_id} injoignable : recherches mises en pause automatiquement.")
-
-
-def _signaler_succes_envoi(chat_id):
-    with get_connection() as conn:
-        conn.execute("UPDATE users SET consecutive_send_failures = 0 WHERE chat_id = ?", (chat_id,))
-
-
-def _apres_envoi(chat_id, ok):
-    if ok:
-        _signaler_succes_envoi(chat_id)
-    else:
-        _signaler_echec_envoi(chat_id)
 
 
 def _echapper_markdown(texte):
@@ -323,8 +250,7 @@ def envoyer_alerte_telegram(chat_id, items):
         else:
             message = f"{badge}🚨 *{_echapper_markdown(item['titre'])}* - 💰 {item['prix']}\n[👉 Voir l'annonce]({item['lien']})"
             ok = envoyer_message(chat_id, message)
-        _apres_envoi(chat_id, ok)
-        return
+        return ok
 
     avec_image = [i for i in items if i.get("image")]
     sans_image = [i for i in items if not i.get("image")]
@@ -343,142 +269,7 @@ def envoyer_alerte_telegram(chat_id, items):
 
     if a_lister:
         resultats.append(_envoyer_liste_texte(chat_id, a_lister, entete))
-    _apres_envoi(chat_id, all(resultats))
-
-
-def _traiter_une_recherche(row):
-    search_id, chat_id, query, min_price, max_price, size, status, limit_count, exclude_keywords = row
-    time.sleep(random.uniform(0, DELAY_BETWEEN_SEARCHES))  # évite une rafale de requêtes simultanées vers Vinted
-
-    resultats = chercher_vinted(query, min_price, max_price, size, status, limit_count)
-    resultats = _filtrer_mots_exclus(resultats, exclude_keywords)
-    nouveaux, baisses = filtrer_doublons_et_baisses(chat_id, resultats)
-
-    # Détection de "vraie" bonne affaire : compare le prix de chaque nouvel
-    # article à la moyenne mobile des prix vus pour CETTE recherche (et pas
-    # juste "moins cher qu'avant" comme la détection de baisse ci-dessous).
-    for item in nouveaux:
-        prix_float = _parse_prix(item["prix"])
-        avg_avant, count_avant = (None, 0)
-        if prix_float:
-            avg_avant, count_avant = maj_stats_prix_recherche(search_id, prix_float)
-        item["bonne_affaire"] = bool(
-            prix_float and avg_avant and count_avant >= REAL_DEAL_MIN_SAMPLES
-            and prix_float < REAL_DEAL_THRESHOLD * avg_avant
-        )
-
-    if nouveaux:
-        envoyer_alerte_telegram(chat_id, nouveaux)
-
-    for b in baisses:
-        msg = (
-            f"📉 *BAISSE DE PRIX DÉTECTÉE !*\n\n🚨 **{b['titre']}**\n"
-            f"💰 Ancien : {b['ancien_prix']}€ ➡️ **Nouveau : {b['nouveau_prix']}**\n"
-            f"[👉 Saisir l'affaire]({b['lien']})"
-        )
-        if b.get("image"):
-            envoyer_photo(chat_id, b["image"], msg)
-        else:
-            envoyer_message(chat_id, msg)
-
-
-def _traiter_une_veille_vendeur(row):
-    """⚠️ Repose sur des endpoints Vinted non testés en conditions réelles
-    (voir vinted_scraper.py) : à valider avant de compter dessus en prod."""
-    watch_id, chat_id, seller_id, seller_label, limit_count = row
-    time.sleep(random.uniform(0, DELAY_BETWEEN_SEARCHES))
-
-    resultats = chercher_items_vendeur(seller_id, limit_count)
-    nouveaux, _ = filtrer_doublons_et_baisses(chat_id, resultats)
-    if nouveaux:
-        for item in nouveaux:
-            item["titre"] = f"[👤 {seller_label}] {item['titre']}"
-        envoyer_alerte_telegram(chat_id, nouveaux)
-
-
-def _verifier_wishlist():
-    """⚠️ Repose sur obtenir_prix_item(), non testé en conditions réelles."""
-    for item_id, chat_id, item_url, titre, prix_dernier in toute_la_wishlist():
-        try:
-            titre_actuel, prix_actuel = obtenir_prix_item(item_url)
-        except Exception as e:
-            logger.error(f"Erreur vérif wishlist item {item_id} : {e}")
-            continue
-        if prix_actuel is None:
-            continue
-        if prix_dernier and prix_actuel < prix_dernier:
-            envoyer_message(
-                chat_id,
-                f"❤️📉 *Baisse de prix sur ta wishlist !*\n\n**{titre or titre_actuel}**\n"
-                f"💰 {prix_dernier}€ ➡️ **{prix_actuel}€**\n[👉 Voir l'annonce]({item_url})",
-            )
-        if prix_actuel != prix_dernier:
-            maj_prix_wishlist(item_id, prix_actuel)
-
-
-def _pinger_heartbeat():
-    """Ping périodique vers un service externe (ex: healthchecks.io) : si le
-    bot plante ou reste bloqué, une alerte part automatiquement au bout du
-    délai configuré côté service, au lieu de le découvrir au hasard."""
-    if not HEALTHCHECK_URL:
-        return
-    try:
-        requests.get(HEALTHCHECK_URL, timeout=10)
-    except Exception as e:
-        logger.warning(f"Heartbeat : échec du ping ({e})")
-
-
-def _dans_la_plage_horaire():
-    """La plage est relue à chaque cycle depuis la base : la commande dev
-    /plage la modifie à chaud, sans redémarrer le bot."""
-    debut, fin = get_plage_horaire()
-    return heure_dans_plage(time.localtime().tm_hour, debut, fin)
-
-
-_last_purge_ts = 0
-
-
-def background_monitor():
-    global _last_purge_ts
-    while True:
-        try:
-            purger_premium_expire()
-
-            if time.time() - _last_purge_ts > PURGE_INTERVAL_SECONDS:
-                n = purger_anciennes_donnees(DATA_RETENTION_DAYS)
-                if n:
-                    logger.info(f"Purge auto : {n} ligne(s) supprimée(s) (> {DATA_RETENTION_DAYS} jours).")
-                _last_purge_ts = time.time()
-
-            if _dans_la_plage_horaire():
-                with get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT id, chat_id, query, min_price, max_price, size, status, limit_count, exclude_keywords "
-                        "FROM searches WHERE is_paused = 0"
-                    )
-                    surveillances = cursor.fetchall()
-
-                # Quelques recherches traitées en parallèle : la veille reste réactive
-                # même avec plusieurs dizaines d'utilisateurs, sans surcharger Vinted.
-                with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
-                    list(executor.map(_traiter_une_recherche, surveillances))
-
-                veilles_vendeur = toutes_les_veilles_vendeur_actives()
-                if veilles_vendeur:
-                    with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
-                        list(executor.map(_traiter_une_veille_vendeur, veilles_vendeur))
-
-                _verifier_wishlist()
-            else:
-                debut, fin = get_plage_horaire()
-                logger.info(f"Hors plage horaire de veille ({debut}h-{fin}h) : cycle sauté.")
-
-            _pinger_heartbeat()
-
-        except Exception as e:
-            logger.error(f"Erreur moniteur : {e}")
-        time.sleep(MONITOR_CYCLE_SECONDS)
+    return all(resultats)
 
 
 def _envoyer_apercu_immediat(chat_id, query, min_p, max_p, size, status, limit_count, exclude_keywords):
@@ -488,15 +279,15 @@ def _envoyer_apercu_immediat(chat_id, query, min_p, max_p, size, status, limit_c
     try:
         apercu_limit = min(limit_count, 3)
         resultats = chercher_vinted(query, min_p, max_p, size, status, apercu_limit)
-        resultats = _filtrer_mots_exclus(resultats, exclude_keywords)
-        nouveaux, _ = filtrer_doublons_et_baisses(chat_id, resultats)
+        resultats = filter_excluded_keywords(resultats, exclude_keywords)
+        nouveaux, _ = filter_duplicates_and_price_drops(chat_id, resultats)
         if nouveaux:
             envoyer_message(chat_id, f"🔍 *Aperçu immédiat* — {len(nouveaux)} exemple(s) de ce que tu vas recevoir :")
             envoyer_alerte_telegram(chat_id, nouveaux)
         else:
             envoyer_message(chat_id, "🔍 Aperçu immédiat : rien à montrer pour l'instant, mais la veille continue en arrière-plan.")
-    except Exception as e:
-        logger.error(f"Erreur aperçu immédiat pour {chat_id} : {e}")
+    except Exception:
+        logger.exception("Immediate preview failed for %s", chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -535,10 +326,11 @@ def _libelle_etats(status):
 
 
 def _avec_retour(rows, step):
-    """Ajoute la ligne ⬅️ Retour sous un clavier inline (sauf à la toute 1re étape)."""
+    """Ajoute Annuler à chaque étape et Retour sauf à la première."""
     rows = list(rows)
     if step != "waiting_query":
         rows.append([{"text": "⬅️ Retour", "callback_data": f"back_{step}"}])
+    rows.append([{"text": "❌ Annuler", "callback_data": "cancel_search"}])
     return {"inline_keyboard": rows}
 
 
@@ -613,7 +405,7 @@ def poser_etape(chat_id, step):
     """Affiche la question correspondant à une étape (utilisé en avançant ET en revenant en arrière)."""
     state = user_states.get(chat_id) or {}
     if step == "waiting_query":
-        envoyer_message(chat_id, "🔍 Quel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)")
+        envoyer_message(chat_id, "🔍 What item would you like to find? (e.g. `nike tn`, `carhartt`)" if langue_utilisateur(chat_id) == "en" else "🔍 Quel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)", reply_markup=_avec_retour([], step))
     elif step == "waiting_min_price":
         envoyer_message(chat_id, "💰 Entre le *Prix Min* (ex: `10` ou `0` pour ignorer).", reply_markup=_avec_retour([], step))
     elif step == "waiting_max_price":
@@ -692,11 +484,16 @@ def finaliser_creation_recherche(chat_id):
             del user_states[chat_id]
             return
 
-        cursor.execute(
-            "INSERT INTO searches (chat_id, query, min_price, max_price, size, size_label, status, limit_count, is_paused, exclude_keywords) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-            (chat_id, q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords),
-        )
+        if state.get("editing_search_id"):
+            cursor.execute(
+                "UPDATE searches SET query=?, min_price=?, max_price=?, size=?, size_label=?, status=?, limit_count=?, exclude_keywords=? WHERE id=? AND chat_id=?",
+                (q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords, state["editing_search_id"], chat_id),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO searches (chat_id, query, min_price, max_price, size, size_label, status, limit_count, is_paused, exclude_keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (chat_id, q, min_p, max_p, size, size_label, status, limit_count, exclude_keywords),
+            )
 
     exclude_txt = f"🚫 Exclu : `{exclude_keywords}`\n" if exclude_keywords else ""
     resume_msg = (
@@ -804,6 +601,13 @@ def _gerer_callback_assistant(callback, chat_id, data_callback):
     step = state.get("step")
 
     # --- ⬅️ Retour ---
+    if data_callback == "cancel_search":
+        repondre()
+        _maj_boutons(chat_id, message_id, {"inline_keyboard": []})
+        del user_states[chat_id]
+        envoyer_message(chat_id, "❌ Search creation cancelled." if langue_utilisateur(chat_id) == "en" else "❌ Création de recherche annulée.")
+        return
+
     if data_callback.startswith("back_"):
         if data_callback[len("back_"):] != step:  # bouton d'un ancien message
             repondre("↩️ Ce bouton n'est plus actif.")
@@ -882,13 +686,48 @@ def gerer_callback_query(callback):
         return
 
     # Idem pour ⬅️ Retour et les sélections multiples de l'assistant /newsearch.
-    if data_callback.startswith(("back_", "tsz", "tst")):
+    if data_callback.startswith(("back_", "tsz", "tst", "cancel_search")):
         _gerer_callback_assistant(callback, chat_id, data_callback)
         return
 
     envoyer_requete(URL_TELEGRAM_SENDER, "answerCallbackQuery", {"callback_query_id": query_id})
 
-    if data_callback.startswith("del_"):
+    if data_callback.startswith("manage_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            row = conn.execute("SELECT id, query, is_paused FROM searches WHERE id=? AND chat_id=?", (search_id, chat_id)).fetchone()
+        if not row:
+            return
+        en = langue_utilisateur(chat_id) == "en"
+        status = "paused" if row[2] else "active"
+        keyboard = [[{"text": "▶️ Resume" if row[2] else "⏸️ Pause", "callback_data": f"toggle_{search_id}"}, {"text": "✏️ Edit", "callback_data": f"edit_{search_id}"}], [{"text": "🗑️ Delete", "callback_data": f"del_{search_id}"}]]
+        envoyer_message(chat_id, (f"🔍 *{row[1]}* — {status}" if en else f"🔍 *{row[1]}* — {'en pause' if row[2] else 'active'}"), reply_markup={"inline_keyboard": keyboard})
+    elif data_callback.startswith("toggle_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            conn.execute("UPDATE searches SET is_paused = 1 - is_paused WHERE id=? AND chat_id=?", (search_id, chat_id))
+        envoyer_message(chat_id, "✅ Search status updated." if langue_utilisateur(chat_id) == "en" else "✅ Statut de la recherche mis à jour.")
+    elif data_callback.startswith("edit_"):
+        search_id = data_callback.split("_", 1)[1]
+        with get_connection() as conn:
+            row = conn.execute("SELECT query,min_price,max_price,size,size_label,status,limit_count,exclude_keywords FROM searches WHERE id=? AND chat_id=?", (search_id, chat_id)).fetchone()
+        if not row:
+            return
+        user_states[chat_id] = {"step":"waiting_query", "history":[], "editing_search_id":search_id, "query":row[0], "min_price":row[1], "max_price":row[2], "size":row[3], "size_label":row[4], "status":row[5], "limit_count":row[6], "exclude_keywords":row[7]}
+        envoyer_message(chat_id, (f"✏️ Editing *{row[0]}*. Send the new keyword (or send the same one)." if langue_utilisateur(chat_id)=="en" else f"✏️ Modification de *{row[0]}*. Envoie le nouveau mot-clé (ou le même)."), reply_markup=_avec_retour([], "waiting_query"))
+    elif data_callback.startswith("lang_"):
+        language = data_callback.rsplit("_", 1)[1]
+        if language in ("fr", "en"):
+            with get_connection() as conn:
+                conn.execute("UPDATE users SET language=? WHERE chat_id=?", (language, chat_id))
+            envoyer_message(chat_id, "✅ Language updated." if language == "en" else "✅ Langue mise à jour.", reply_markup=clavier_principal(chat_id))
+    elif data_callback.startswith("notify_"):
+        mode = data_callback.rsplit("_", 1)[1]
+        if mode in ("instant", "quiet"):
+            with get_connection() as conn:
+                conn.execute("UPDATE searches SET notification_mode=? WHERE chat_id=?", (mode, chat_id))
+            envoyer_message(chat_id, "✅ Notification preference updated." if langue_utilisateur(chat_id)=="en" else "✅ Préférence de notification mise à jour.")
+    elif data_callback.startswith("del_"):
         search_id = data_callback.split("_")[1]
         with get_connection() as conn:
             conn.execute("DELETE FROM searches WHERE id = ? AND chat_id = ?", (search_id, chat_id))
@@ -936,7 +775,8 @@ def gerer_callback_query(callback):
 
     elif data_callback == "restart_search":
         user_states[chat_id] = {"step": "waiting_query", "history": []}
-        envoyer_message(chat_id, "🔄 Pas de souci, recommençons.\n\n🔍 Quel article souhaites-tu rechercher ?")
+        envoyer_message(chat_id, "🔄 No problem, let's start again." if langue_utilisateur(chat_id) == "en" else "🔄 Pas de souci, recommençons.")
+        poser_etape(chat_id, "waiting_query")
 
     elif data_callback.startswith("warn_"):
         state = user_states.get(chat_id)
@@ -957,7 +797,7 @@ def gerer_callback_query(callback):
 
 def gerer_assistant_recherche(chat_id, text, state):
     step = state["step"]
-    if text.lower() in ["/cancel", "/stop", "annuler"]:
+    if text.lower() in ["/stop", "annuler"]:
         del user_states[chat_id]
         envoyer_message(chat_id, "❌ Action annulée.")
         return
@@ -1057,14 +897,16 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
                     envoyer_message(chat_id, f"🎁 Tu as été parrainé ! +{REFERRAL_BONUS_DAYS} jour(s) de Premium offerts.")
                     envoyer_message(referrer_id, f"🎉 Un ami a rejoint VintedPulse grâce à ton lien ! +{REFERRAL_BONUS_DAYS} jour(s) de Premium offerts.")
 
-        envoyer_message(
-            chat_id,
-            "🤖 *Bienvenue sur VintedPulse Bot !*\n\nTon compte est actif et connecté. Tape `/newsearch` pour créer ta première alerte de veille.",
-            reply_markup=clavier_principal(),
-        )
+        en = langue_utilisateur(chat_id) == "en"
+        bienvenue = ("🤖 *Welcome to VintedPulse Bot!*\n\nYour account is active and connected. "
+                     "Use `/newsearch` to create your first alert.\n\n" if en else
+                     "🤖 *Bienvenue sur VintedPulse Bot !*\n\nTon compte est actif et connecté. "
+                     "Utilise `/recherche` pour créer ta première alerte.\n\n")
+        envoyer_message(chat_id, bienvenue + aide_message(chat_id), reply_markup=clavier_principal(chat_id))
         return
 
-    if text == "/newsearch":
+    en = langue_utilisateur(chat_id) == "en"
+    if text == ("/newsearch" if en else "/recherche"):
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT is_premium FROM users WHERE chat_id = ?", (chat_id,))
@@ -1090,13 +932,21 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
             return
 
         user_states[chat_id] = {"step": "waiting_query", "history": []}
-        envoyer_message(chat_id, "🔍 *Nouvelle Recherche Vinted*\n\nQuel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)")
+        envoyer_message(chat_id,
+            "🔍 *New Vinted Search*\n\nWhat item would you like to find? (e.g. `nike tn`, `carhartt`)" if en else "🔍 *Nouvelle recherche Vinted*\n\nQuel article souhaites-tu rechercher ? (ex: `nike tn`, `carhartt`)",
+            reply_markup=_avec_retour([], "waiting_query"))
         return
 
     if text in ["/disconnect", "/unlink"]:
         with get_connection() as conn:
             conn.execute("UPDATE users SET is_linked = 0 WHERE chat_id = ?", (chat_id,))
         envoyer_message(chat_id, "🔌 *Compte dissocié avec succès !*")
+        return
+
+    if text == "/deleteaccount":
+        supprimer_utilisateur_complet(chat_id)
+        user_states.pop(chat_id, None)
+        envoyer_message(chat_id, "🗑️ Toutes tes données et recherches ont été supprimées définitivement.")
         return
 
     if text in ["/delete", "/supprimer"]:
@@ -1117,19 +967,11 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         envoyer_message(chat_id, "🛑 **Toutes vos recherches ont été arrêtées et supprimées d'un coup !**")
         return
 
-    if text == "/cancel":
-        if chat_id in user_states:
-            del user_states[chat_id]
-            envoyer_message(chat_id, "❌ Création de recherche annulée.")
-        else:
-            envoyer_message(chat_id, "ℹ️ Aucune action en cours à annuler.")
-        return
-
     if text in ["/list", "/mes-recherches"]:
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT query, min_price, max_price, size_label, limit_count, exclude_keywords, is_paused, status "
+                "SELECT id, query, min_price, max_price, size_label, limit_count, exclude_keywords, is_paused, status "
                 "FROM searches WHERE chat_id = ?",
                 (chat_id,),
             )
@@ -1137,14 +979,20 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         if queries:
             msg = "📋 *Vos recherches actives :*\n"
             for q in queries:
-                label_taille = q[3] if q[3] else "Toutes"
-                excl_txt = f" | 🚫 {q[5]}" if q[5] else ""
-                pause_txt = " ⏸️" if q[6] else ""
-                etat_txt = f" | État: {_libelle_etats(q[7])}" if q[7] else ""
-                msg += f"• `{q[0]}` (Prix: {q[1] or '0'}€-{q[2] or 'Max'}€ | Taille: {label_taille}{etat_txt} | Échantillon: {q[4]}{excl_txt}){pause_txt}\n"
+                label_taille = q[4] if q[4] else "Toutes"
+                excl_txt = f" | 🚫 {q[6]}" if q[6] else ""
+                pause_txt = " ⏸️" if q[7] else ""
+                etat_txt = f" | État: {_libelle_etats(q[8])}" if q[8] else ""
+                msg += f"• `{q[1]}` (Prix: {q[2] or '0'}€-{q[3] or 'Max'}€ | Taille: {label_taille}{etat_txt} | Échantillon: {q[5]}{excl_txt}){pause_txt}\n"
         else:
             msg = "Aucune recherche active."
-        envoyer_message(chat_id, msg)
+        keyboard = [[{"text": f"⚙️ {q[1][:35]}", "callback_data": f"manage_{q[0]}"}] for q in queries] if queries else None
+        envoyer_message(chat_id, msg, reply_markup={"inline_keyboard": keyboard} if keyboard else None)
+        return
+
+    if text in ["/preferences", "/language"]:
+        en = langue_utilisateur(chat_id) == "en"
+        envoyer_message(chat_id, "⚙️ Preferences" if en else "⚙️ Préférences", reply_markup={"inline_keyboard":[[{"text":"🇫🇷 Français","callback_data":"lang_fr"},{"text":"🇬🇧 English","callback_data":"lang_en"}],[{"text":"🔔 Instant","callback_data":"notify_instant"},{"text":"🌙 Quiet","callback_data":"notify_quiet"}]]})
         return
 
     if text == "/pause":
@@ -1246,9 +1094,9 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         # pour n'être alerté que des NOUVELLES annonces (et pas de tout le
         # catalogue existant au premier cycle).
         try:
-            filtrer_doublons_et_baisses(chat_id, chercher_items_vendeur(seller_id, 96))
-        except Exception as e:
-            logger.error(f"Baseline vendeur {seller_id} impossible : {e}")
+            filter_duplicates_and_price_drops(chat_id, chercher_items_vendeur(seller_id, 96))
+        except Exception:
+            logger.exception("Seller baseline failed for %s", seller_id)
         envoyer_message(chat_id, f"🕵️ Veille activée sur le vendeur **{label or identifiant}** ! Tu seras alerté de ses nouvelles annonces.")
         return
 
@@ -1269,13 +1117,33 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         return
 
     if text in ["/help", "/aide"]:
-        aide_msg = (
+        envoyer_message(chat_id, aide_message(chat_id), reply_markup=clavier_principal(chat_id))
+        return
+
+
+def aide_message(chat_id):
+    if langue_utilisateur(chat_id) == "en":
+        return (
+            "🛠️ *Help - VintedPulse*\n\n"
+            "• `/newsearch`: Create an alert step by step.\n"
+            "• `/list`: View your searches.\n"
+            "• `/delete`: Delete a search.\n"
+            "• `/stop`: Stop all searches.\n"
+            "• `/pause` / `/resume`: Pause / resume monitoring.\n"
+            "• `/watch <link>`: Add an item to the wishlist.\n"
+            "• `/wishlist`: View/manage your wishlist.\n"
+            "• `/trackseller <username>`: Follow a seller.\n"
+            "• `/sellers`: View/manage followed sellers.\n"
+            "• `/parrain`: Your referral link.\n"
+            "• `/disconnect`: Disconnect your account.\n"
+            "• `/feedback`: Suggest an idea."
+        )
+    return (
             "🛠️ *Aide - VintedPulse*\n\n"
-            "• `/newsearch` : Créer une alerte pas à pas.\n"
+            "• `/recherche` : Créer une alerte pas à pas.\n"
             "• `/list` : Vos recherches.\n"
             "• `/delete` : Supprimer une recherche.\n"
             "• `/stop` : Tout stopper d'un coup.\n"
-            "• `/cancel` : Annuler la création en cours.\n"
             "• `/pause` / `/resume` : Mettre en pause / reprendre la veille.\n"
             "• `/watch <lien>` : Ajouter une annonce à la wishlist.\n"
             "• `/wishlist` : Voir/gérer ta wishlist.\n"
@@ -1285,16 +1153,15 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
             "• `/disconnect` : Dissocier le compte.\n"
             "• `/feedback` : Suggérer une idée."
         )
-        envoyer_message(chat_id, aide_msg, reply_markup=clavier_principal())
-        return
 
 
-def ecouter_telegram():
+def ecouter_telegram(stop_event=None):
+    stop_event = stop_event or shutdown_event
     envoyer_requete(URL_TELEGRAM_SENDER, "deleteWebhook?drop_pending_updates=true", {})
 
     offset = 0
     logger.info("🤖 Bot Sender (@VintedPulseBot) 100% opérationnel...")
-    while True:
+    while not stop_event.is_set():
         try:
             response = requests.get(URL_TELEGRAM_SENDER + f"getUpdates?offset={offset}&timeout=30", timeout=35)
             data = response.json()
@@ -1313,16 +1180,24 @@ def ecouter_telegram():
                             gerer_assistant_recherche(chat_id, text, user_states[chat_id])
                         else:
                             gerer_commandes_texte(chat_id, text, message_from)
-        except Exception as e:
-            logger.error(f"Erreur polling sender : {e}")
-            time.sleep(5)
+        except Exception:
+            # A malformed Telegram update or one handler must not stop polling.
+            logger.exception("Sender polling failed; retrying in five seconds.")
+            stop_event.wait(5)
+
+
+@app.on_event("shutdown")
+def stop_background_workers():
+    """Let polling and monitoring leave their loops cleanly on server stop."""
+    shutdown_event.set()
 
 
 if __name__ == "__main__":
     init_db()
     definir_commandes_sender()
-    threading.Thread(target=ecouter_telegram, daemon=True).start()
-    threading.Thread(target=background_monitor, daemon=True).start()
+    threading.Thread(target=ecouter_telegram, args=(shutdown_event,), daemon=True, name="telegram-polling").start()
+    monitor = MonitorService(envoyer_alerte_telegram, envoyer_message, envoyer_photo)
+    threading.Thread(target=monitor.run_forever, args=(shutdown_event,), daemon=True, name="search-monitor").start()
 
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -1,0 +1,16 @@
+# Secrets and production data
+.env
+tokens.txt
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local downloads and editor files
+download/
+.vscode/
+.idea/
