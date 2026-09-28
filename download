@@ -1,0 +1,10 @@
+# Copie ce fichier en ".env" (même dossier) et remplis tes vraies valeurs.
+# Ne commite JAMAIS le fichier ".env" lui-même (ajoute-le à .gitignore).
+
+CENTRAL_BOT_TOKEN=8868084608:AAFYXRQrW-2rQTUzWtIjxpUz_V23WwwbN-0
+SENDER_BOT_TOKEN=8829996386:AAEQy8tC7Yy71E2lIFl2C9M5V9ifQtauamo
+DEV_BOT_TOKEN=8696552987:AAHelGjgzrUQEN_Wd44rtSO7rsEybHJNTyw
+DEV_CHAT_ID=6900436167
+
+DB_PATH=vinted_bot.db
+TOKENS_FILE=tokens.txt
