@@ -15,6 +15,77 @@ from logger_config import get_logger
 logger = get_logger("bot_centrale")
 
 app = FastAPI()
+hub_states = {}
+
+
+def _lang(chat_id):
+    with get_connection() as conn:
+        row = conn.execute("SELECT language FROM users WHERE chat_id = ?", (str(chat_id),)).fetchone()
+    return row[0] if row and row[0] in ("fr", "en") else "fr"
+
+
+def _hub_keyboard(rows):
+    return {"inline_keyboard": rows}
+
+
+def _hub_step4(chat_id):
+    en = _lang(chat_id) == "en"
+    text = (
+        "👑 *Premium access*\n\nYou can use VintedPulse for free with *one active search*. "
+        "A Premium token unlocks multiple simultaneous searches.\n\nDo you have a Premium token? "
+        "You can enter it now or continue with the free plan.\n\n"
+        "👉 [Open VintedPulse Bot](https://t.me/VintedPulseBot) and send `/start` to create alerts."
+        if en else
+        "👑 *Accès Premium*\n\nTu peux utiliser VintedPulse gratuitement avec *une recherche active*. "
+        "Un token Premium débloque plusieurs recherches simultanées.\n\nAs-tu un token Premium ? "
+        "Tu peux le saisir maintenant ou continuer avec le plan gratuit.\n\n"
+        "👉 [Ouvrir VintedPulse Bot](https://t.me/VintedPulseBot) puis tape `/start` pour créer tes alertes."
+    )
+    buttons = [[{"text": "🔑 Enter my token" if en else "🔑 Entrer mon token", "callback_data": "hub_token"}],
+               [{"text": "🚀 Continue free" if en else "🚀 Continuer gratuitement", "url": "https://t.me/VintedPulseBot"}]]
+    envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, text, reply_markup=_hub_keyboard(buttons))
+
+
+def gerer_callback_hub(callback):
+    chat_id = str(callback["message"]["chat"]["id"])
+    data = callback["data"]
+    envoyer_requete(URL_TELEGRAM_CENTRAL, "answerCallbackQuery", {"callback_query_id": callback["id"]})
+    if data.startswith("hub_lang_"):
+        language = data.rsplit("_", 1)[1]
+        if language not in ("fr", "en"):
+            return
+        with get_connection() as conn:
+            conn.execute("UPDATE users SET language = ? WHERE chat_id = ?", (language, chat_id))
+        en = language == "en"
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id,
+            "Do you already know how the bot works?" if en else "Tu connais déjà le principe du bot ?",
+            reply_markup=_hub_keyboard([[{"text": "Yes" if en else "Oui", "callback_data": "hub_known"},
+                                         {"text": "No" if en else "Non", "callback_data": "hub_unknown"}]]))
+    elif data == "hub_known":
+        _hub_step4(chat_id)
+    elif data == "hub_unknown":
+        en = _lang(chat_id) == "en"
+        text = ("VintedPulse monitors Vinted for you and sends an alert as soon as a matching item appears. "
+                "Create a search, choose your filters, then let the bot watch in the background.\n\n"
+                "You can also pause alerts, follow sellers and track an item's price."
+                if en else
+                "VintedPulse surveille Vinted pour toi et t'envoie une alerte dès qu'un article correspondant apparaît. "
+                "Crée une recherche, choisis tes filtres, puis laisse le bot surveiller en arrière-plan.\n\n"
+                "Tu peux aussi mettre tes alertes en pause, suivre des vendeurs et suivre le prix d'une annonce.")
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, text, reply_markup=_hub_keyboard(
+            [[{"text": "I understand" if en else "J'ai tout compris", "callback_data": "hub_understood"}],
+             [{"text": "Explain in detail" if en else "M'expliquer en détail", "callback_data": "hub_detailed"}]]))
+    elif data == "hub_detailed":
+        en = _lang(chat_id) == "en"
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id,
+            ("*How to use it in detail*\n\n1. Open the Sender bot.\n2. Start a new search and enter an item name.\n3. Set prices, excluded words, sizes and condition.\n4. Confirm: VintedPulse checks Vinted regularly and sends only new matching listings.\n\nThe free plan includes one active search; Premium allows several." if en else
+             "*Comment l'utiliser en détail*\n\n1. Ouvre le bot Sender.\n2. Lance une nouvelle recherche et indique le nom de l'article.\n3. Renseigne les prix, mots exclus, tailles et états.\n4. Confirme : VintedPulse vérifie Vinted régulièrement et t'envoie uniquement les nouvelles annonces correspondantes.\n\nLe plan gratuit comprend une recherche active ; Premium en permet plusieurs."))
+        _hub_step4(chat_id)
+    elif data == "hub_understood":
+        _hub_step4(chat_id)
+    elif data == "hub_token":
+        hub_states[chat_id] = "waiting_token"
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, "Send your Premium token." if _lang(chat_id) == "en" else "Envoie ton token Premium.")
 
 
 def definir_commandes_central():
@@ -51,17 +122,17 @@ def gerer_commandes_central(message_obj):
 
     if text == "/start":
         upsert_user(chat_id, first_name=first_name, username=username, is_linked=1)
-        msg = (
-            "👋 *Bienvenue sur VintedPulse Hub !*\n\n"
-            "🚀 Notre bot d'alertes instantanées est prêt à l'emploi.\n\n"
-            "👉 Rendez-vous directement sur le bot d'alertes : \n"
-            "[VintedPulse Bot](https://t.me/VintedPulseBot)\n"
-            "Tapez `/start` pour lancer vos recherches !\n\n"
-            "💡 *Commandes utiles ici :*\n"
-            "• `/activate <token>` : Activer votre abonnement Premium.\n"
-            "• `/status` : Vérifier votre abonnement."
-        )
-        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, msg)
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, "🌐 Choose your language:" if _lang(chat_id) == "en" else "🌐 Choisis ta langue :",
+            reply_markup=_hub_keyboard([[{"text": "🇬🇧 EN", "callback_data": "hub_lang_en"}, {"text": "🇫🇷 FR", "callback_data": "hub_lang_fr"}]]))
+
+    elif hub_states.get(chat_id) == "waiting_token":
+        hub_states.pop(chat_id, None)
+        resultat = activer_token(chat_id, text.strip(), first_name, username)
+        en = _lang(chat_id) == "en"
+        messages = {"ok": "🎉 Token accepted! Your account is now *Premium*." if en else "🎉 *Token accepté !* Ton compte est désormais **Premium**.",
+                    "already_used": "❌ This token has already been used." if en else "❌ Ce token a déjà été activé par un autre compte.",
+                    "invalid": "❌ Invalid token." if en else "❌ Token invalide."}
+        envoyer_message(URL_TELEGRAM_CENTRAL, chat_id, messages.get(resultat, messages["invalid"]))
 
     elif text.startswith("/activate"):
         parts = text.split(" ")
@@ -267,7 +338,9 @@ def ecouter_telegram_central():
             if data.get("ok"):
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
-                    if "message" in update:
+                    if "callback_query" in update:
+                        gerer_callback_hub(update["callback_query"])
+                    elif "message" in update:
                         gerer_commandes_central(update["message"])
         except Exception as e:
             logger.error(f"Erreur bot central : {e}")

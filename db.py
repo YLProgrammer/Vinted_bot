@@ -64,6 +64,7 @@ COLONNES_ATTENDUES = {
         ("ignore_warning_100", "INTEGER DEFAULT 0"),
         ("consecutive_send_failures", "INTEGER DEFAULT 0"),
         ("premium_expires_at", "TIMESTAMP"),
+        ("language", "TEXT DEFAULT 'fr'"),
         ("referred_by", "TEXT"),
         ("referral_credits", "INTEGER DEFAULT 0"),
     ],
@@ -255,7 +256,7 @@ def get_user(chat_id):
         cursor.execute(
             "SELECT chat_id, first_name, username, is_linked, is_premium, "
             "ignore_warning_20, ignore_warning_50, ignore_warning_100, consecutive_send_failures, "
-            "premium_expires_at, referred_by, referral_credits "
+            "premium_expires_at, referred_by, referral_credits, language "
             "FROM users WHERE chat_id = ?",
             (chat_id,),
         )
@@ -266,7 +267,7 @@ def get_user(chat_id):
             "chat_id", "first_name", "username", "is_linked", "is_premium",
             "ignore_warning_20", "ignore_warning_50", "ignore_warning_100",
             "consecutive_send_failures", "premium_expires_at", "referred_by",
-            "referral_credits",
+            "referral_credits", "language",
         ]
         return dict(zip(keys, row))
 
