@@ -6,10 +6,10 @@ from fastapi import FastAPI
 from config import URL_TELEGRAM_CENTRAL, URL_TELEGRAM_DEV, DEV_CHAT_ID
 from db import (
     init_db, get_connection, upsert_user, accorder_premium, retirer_premium,
-    get_plage_horaire, set_plage_horaire, heure_dans_plage,
+    get_plage_horaire, set_plage_horaire, heure_dans_plage, supprimer_utilisateur_complet,
 )
 from telegram_utils import envoyer_message, envoyer_requete
-from token_manager import activer_token
+from token_manager import activer_token, creer_token, revoquer_token
 from logger_config import get_logger
 
 logger = get_logger("bot_centrale")
@@ -224,9 +224,25 @@ def gerer_commandes_dev(chat_id, text):
             target_id = parts[1].strip()
             with get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM users WHERE chat_id = ?", (target_id,))
-                cursor.execute("DELETE FROM searches WHERE chat_id = ?", (target_id,))
+                supprimer_utilisateur_complet(target_id)
             envoyer_message(URL_TELEGRAM_DEV, chat_id, f"🔨 Utilisateur `{target_id}` banni et ses recherches supprimées avec succès.")
+
+    elif text.startswith("/createtoken"):
+        parts = text.split(maxsplit=2)
+        try:
+            jours = int(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            envoyer_message(URL_TELEGRAM_DEV, chat_id, "⚠️ Utilisation : `/createtoken [jours] [libellé]`")
+            return
+        token = creer_token(jours, parts[2] if len(parts) > 2 else None)
+        envoyer_message(URL_TELEGRAM_DEV, chat_id, f"🔑 Token créé (à copier maintenant) : `{token}`")
+
+    elif text.startswith("/revoketoken"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            envoyer_message(URL_TELEGRAM_DEV, chat_id, "⚠️ Utilisation : `/revoketoken <token>`")
+        else:
+            envoyer_message(URL_TELEGRAM_DEV, chat_id, "✅ Token révoqué." if revoquer_token(parts[1]) else "⚠️ Token introuvable.")
 
     elif text.startswith("/stopsearch"):
         parts = text.split(" ")

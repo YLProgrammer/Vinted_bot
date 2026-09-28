@@ -15,7 +15,7 @@ from config import (
     REAL_DEAL_THRESHOLD, REAL_DEAL_MIN_SAMPLES, REFERRAL_BONUS_DAYS,
 )
 from db import (
-    init_db, get_connection, upsert_user, get_user,
+    init_db, get_connection, upsert_user, get_user, supprimer_utilisateur_complet,
     credit_referral, purger_premium_expire, maj_stats_prix_recherche,
     ajouter_veille_vendeur, lister_veilles_vendeur, supprimer_veille_vendeur,
     toutes_les_veilles_vendeur_actives,
@@ -106,6 +106,7 @@ def definir_commandes_sender():
         {"command": "delete", "description": "Supprimer une recherche spécifique"},
         {"command": "stop", "description": "🛑 Stopper et supprimer toutes les recherches"},
         {"command": "disconnect", "description": "Dissocier ton compte"},
+        {"command": "deleteaccount", "description": "Supprimer toutes vos données"},
         {"command": "feedback", "description": "Suggérer une idée ou signaler un bug"},
         {"command": "pause", "description": "Mettre en pause la veille des recherches"},
         {"command": "resume", "description": "Reprendre la veille des recherches"},
@@ -1118,6 +1119,12 @@ def gerer_commandes_texte(chat_id, text, message_from=None):
         with get_connection() as conn:
             conn.execute("UPDATE users SET is_linked = 0 WHERE chat_id = ?", (chat_id,))
         envoyer_message(chat_id, "🔌 *Compte dissocié avec succès !*")
+        return
+
+    if text == "/deleteaccount":
+        supprimer_utilisateur_complet(chat_id)
+        user_states.pop(chat_id, None)
+        envoyer_message(chat_id, "🗑️ Toutes tes données et recherches ont été supprimées définitivement.")
         return
 
     if text in ["/delete", "/supprimer"]:

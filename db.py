@@ -111,6 +111,17 @@ def init_db():
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS premium_tokens (
+                token_hash TEXT PRIMARY KEY,
+                label TEXT,
+                expires_at TIMESTAMP,
+                max_uses INTEGER DEFAULT 1,
+                use_count INTEGER DEFAULT 0,
+                revoked_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS searches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id TEXT,
@@ -225,6 +236,18 @@ def init_db():
                 (DATE_SENTINELLE,),
             )
 
+        # Indexes essentiels : les scans tournent continuellement et ces
+        # requêtes deviennent coûteuses dès que la base grandit.
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_searches_active ON searches(is_paused, chat_id)",
+            "CREATE INDEX IF NOT EXISTS idx_seen_items_lookup ON seen_items(chat_id, item_url)",
+            "CREATE INDEX IF NOT EXISTS idx_item_prices_lookup ON item_prices(chat_id, item_url)",
+            "CREATE INDEX IF NOT EXISTS idx_wishlist_chat ON wishlist(chat_id)",
+            "CREATE INDEX IF NOT EXISTS idx_seller_watches_chat ON seller_watches(chat_id)",
+            "CREATE INDEX IF NOT EXISTS idx_carousels_chat_created ON carousels(chat_id, created_at)",
+        ):
+            cursor.execute(statement)
+
 
 def upsert_user(chat_id, first_name=None, username=None, is_linked=None):
     """Crée l'utilisateur s'il n'existe pas encore, sinon met à jour son nom/pseudo."""
@@ -247,6 +270,15 @@ def upsert_user(chat_id, first_name=None, username=None, is_linked=None):
                 "INSERT INTO users (chat_id, first_name, username, is_linked) VALUES (?, ?, ?, ?)",
                 (chat_id, first_name, username, is_linked if is_linked is not None else 0),
             )
+
+
+def supprimer_utilisateur_complet(chat_id):
+    """Efface toutes les données opérationnelles d'un utilisateur."""
+    chat_id = str(chat_id)
+    with get_connection() as conn:
+        for table in ("searches", "seen_items", "item_prices", "seller_watches", "wishlist", "carousels", "feedbacks"):
+            conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
 
 
 def get_user(chat_id):
